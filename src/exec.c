@@ -17,11 +17,18 @@
 #include <inttypes.h>
 #include <grp.h>
 #include <pwd.h>
+#include <poll.h>
 
 #include "hyper.h"
 #include "util.h"
 #include "parse.h"
 #include "syscall.h"
+
+#define close_fd(fd) if (fd >= 0) { close (fd); fd=-1; }
+
+#define STDERR_INDEX 0
+#define STDOUT_INDEX 1
+#define POLL_SIZE 2
 
 struct stdio_config {
 	int stdinfd, stdoutfd, stderrfd;
@@ -813,4 +820,129 @@ int hyper_handle_exec_exit(struct hyper_pod *pod, int pid, uint8_t code)
 	hyper_release_exec(exec);
 
 	return 0;
+}
+
+static int hyper_do_run_cmd (char** args, int stderr_fd, int stdout_fd)
+{
+	if (dup2 (stderr_fd, STDERR_FILENO) < 0) {
+		fprintf (stderr, "failed to dup stderr\n");
+		return 1;
+	}
+
+	if (dup2 (stdout_fd, STDOUT_FILENO) < 0) {
+		fprintf (stderr, "failed to dup stdout\n");
+		return 1;
+	}
+
+	execvp(args[0], args);
+
+	fprintf (stderr, "failed to exec a new process: %s\n", args[0]);
+	return 1;
+}
+
+int hyper_run_cmd (char** args, struct hyper_string* stdout_str,
+	struct hyper_string* stderr_str)
+{
+	int           status = -1;
+	int           ret = -1;
+	int           pid;
+	int           stderr_fd[2] = { -1, -1 };
+	int           stdout_fd[2] = { -1, -1 };
+	int           err_pipe[2] = { -1, -1 };
+	char          buf[BUFSIZ] = { 0 };
+	struct pollfd poll_fds[POLL_SIZE] = { { 0 } };
+
+	if (pipe2 (stderr_fd, O_NONBLOCK) < 0) {
+		fprintf (stderr, "failed to create stderr pipe\n");
+		goto out;
+	}
+
+	if (pipe2 (stdout_fd, O_NONBLOCK) < 0) {
+		fprintf (stderr, "failed to create stdout pipe\n");
+		goto out;
+	}
+
+	if (pipe2 (err_pipe, O_CLOEXEC) < 0) {
+		fprintf (stderr, "failed to create err pipe\n");
+		goto out;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf (stderr, "failed to fork process\n");
+		goto out;
+	} else if (pid == 0){
+		//child
+		close_fd (stderr_fd[0]);
+		close_fd (stdout_fd[0]);
+		close_fd (err_pipe[0]);
+		hyper_do_run_cmd (args, stderr_fd[1], stdout_fd[1]);
+
+		//child setup failed
+		write (err_pipe[1], "E", 1);
+		close_fd (stderr_fd[1]);
+		close_fd (stdout_fd[1]);
+		close_fd (err_pipe[1]);
+		abort();
+	}
+
+	//parent
+	close_fd (stderr_fd[1]);
+	close_fd (stdout_fd[1]);
+	close_fd (err_pipe[1]);
+
+	//block reading child error state
+	ret = read (err_pipe[0], buf, sizeof(buf));
+	if (ret > 0) {
+		fprintf (stderr, "failed to setup child\n");
+		goto out;
+	}
+
+	poll_fds[STDERR_INDEX].fd = stderr_fd[0];
+	poll_fds[STDERR_INDEX].events = POLLIN | POLLPRI;
+
+	poll_fds[STDOUT_INDEX].fd = stdout_fd[0];
+	poll_fds[STDOUT_INDEX].events = POLLIN | POLLPRI;
+
+	while (1) {
+		ret = poll (poll_fds, POLL_SIZE, -1);
+		if (ret == -1 || (poll_fds[STDERR_INDEX].revents == POLLHUP
+				&& poll_fds[STDOUT_INDEX].revents == POLLHUP)) {
+			break;
+		}
+
+		if (poll_fds[STDERR_INDEX].revents & POLLIN) {
+			ret = read(poll_fds[STDERR_INDEX].fd, buf, sizeof(buf));
+			if (ret > 0) {
+				if (hyper_string_append(stderr_str, buf, ret) != 0) {
+					goto out;
+				}
+			}
+		}
+
+		if (poll_fds[STDOUT_INDEX].revents & POLLIN) {
+			ret = read(poll_fds[STDOUT_INDEX].fd, buf, sizeof(buf));
+			if (ret > 0) {
+				if (hyper_string_append(stdout_str, buf, ret) != 0) {
+					goto out;
+				}
+			}
+		}
+	}
+
+	if (waitpid (pid, &status, 0) < 0) {
+		ret = -1;
+		goto out;
+	}
+
+	ret = WEXITSTATUS(status);
+
+out:
+	close_fd (stderr_fd[0]);
+	close_fd (stderr_fd[1]);
+	close_fd (stdout_fd[0]);
+	close_fd (stdout_fd[1]);
+	close_fd (err_pipe[0]);
+	close_fd (err_pipe[1]);
+	return ret;
 }

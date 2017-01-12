@@ -38,6 +38,12 @@ struct hyper_pod global_pod = {
 
 #define MAXEVENTS	10
 
+#define PS_ARGS_SIZE 2
+
+#define strvfree(args) \
+	for(char **i=args; i && *i; i++) { free(*i); } \
+	free(args);
+
 struct hyper_ctl ctl;
 
 sigset_t orig_mask;
@@ -656,6 +662,211 @@ out:
 	return ret;
 }
 
+static int hyper_ps_pid_last_index(const char* title)
+{
+	char *tok = NULL;
+	char *str = NULL;
+	char *saveptr;
+	const char* tokens = "\t ";
+	const char pid_str[] = "PID";
+	const size_t pid_len = sizeof(pid_str)-1;
+	int index = -1;
+
+	str = strdup (title);
+	tok = strtok_r (str, tokens, &saveptr);
+	while (tok) {
+		if (strncmp(tok, pid_str, pid_len) == 0) {
+			/* get the index of last character in PID column
+			 * in order to get the right PID
+			 *   UID   PID
+			 *   root    1
+			 *   root   23
+			 *           ^
+			*/
+			index = (tok-str)+pid_len-1;
+			goto out;
+		}
+		tok = strtok_r (NULL, tokens, &saveptr);
+	}
+
+out:
+	free (str);
+	return index;
+}
+
+static long int hyper_ps_get_pid(const char *line, int pid_last_index)
+{
+	int i;
+	int pid = -1;
+	char *pid_str = NULL;
+	int pid_len = 0;
+	char *endptr;
+
+	for (i=pid_last_index; i>=0; i--) {
+		if (isspace(line[i])) {
+			break;
+		}
+		if (! isdigit(line[i])) {
+			return -1;
+		}
+	}
+
+	if (i != pid_last_index) {
+		pid_len = pid_last_index - i;
+
+		//remove space
+		i+=1;
+
+		// +1 for null terminator
+		pid_str = calloc (pid_len+1, sizeof (*pid_str));
+		strncpy (pid_str, line+i, pid_len);
+		pid = strtol (pid_str, &endptr, 10);
+		free (pid_str);
+		if(! pid) {
+			return -1;
+		}
+	}
+
+	return pid;
+}
+
+static int hyper_ps_container(char *json, int length)
+{
+	struct hyper_container *c;
+	struct hyper_pod *pod = &global_pod;
+	int ret = -1;
+	int psargs_count = 0;
+	int i;
+	const char *arg;
+	char **args = NULL;
+	char **tmp = NULL;
+	JSON_Array *psargs;
+	int index = 0;
+	struct hyper_string* stdout_str = NULL;
+	struct hyper_string* stderr_str = NULL;
+	struct hyper_string* final_ps_output = NULL;
+	char *next_line = NULL;
+	char *current_line = NULL;
+	int pid_last_index;
+	int pid;
+
+	JSON_Value *value = hyper_json_parse(json, length);
+	if (value == NULL) {
+		goto out;
+	}
+
+	const char *id = json_object_get_string(json_object(value), "container");
+	c = hyper_find_container(pod, id);
+	if (c == NULL) {
+		fprintf(stderr, "can not find container whose id is %s\n", id);
+		goto out;
+	}
+
+	//ps + -ef + NULL
+	args = calloc (PS_ARGS_SIZE, sizeof(char *));
+	args[index++] = strdup("ps");
+
+	psargs = json_object_get_array(json_object(value), "psargs");
+	if (psargs) {
+		psargs_count = json_array_get_count(psargs);
+		tmp = realloc (args, (PS_ARGS_SIZE+psargs_count)*sizeof(char *));
+		if (! tmp) {
+			fprintf(stderr, "failed to realloc args\n");
+			goto out;
+		}
+		args = tmp;
+		// copy extra ps args
+		for (i=0; i<psargs_count; i++) {
+			arg = json_array_get_string(psargs, i);
+			if (arg) {
+				args[index++] = strdup(arg);
+			}
+		}
+	}
+
+	if (! psargs_count) {
+		tmp = realloc (args, (PS_ARGS_SIZE+1)*sizeof(char *));
+		if (! tmp) {
+			fprintf(stderr, "failed to realloc args\n");
+			goto out;
+		}
+		args = tmp;
+		//default ps args: -ef
+		args[index++] = strdup("-ef");
+	}
+
+	// NULL terminator
+	args[index++] = NULL;
+
+	stdout_str = hyper_string_new ();
+	stderr_str = hyper_string_new ();
+
+	//run ps command and get its output
+	ret = hyper_run_cmd (args, stdout_str, stderr_str);
+	if (ret) {
+		fprintf (stderr, "%s\n", stderr_str->data);
+		goto out;
+	}
+
+	fprintf (stderr, "FIXME:\n%s\n", stdout_str->data);
+
+	//processing ps output
+	current_line = stdout_str->data;
+
+	next_line = hyper_next_line (current_line);
+	if (! next_line) {
+		goto out;
+	}
+
+	pid_last_index = hyper_ps_pid_last_index(current_line);
+	if (pid_last_index < 0) {
+		goto out;
+	}
+
+	//create final ps output and copy the title
+	final_ps_output = hyper_string_new ();
+
+	hyper_string_append (final_ps_output, current_line, next_line-current_line);
+	hyper_string_append (final_ps_output, "\n", 1);
+
+	while ((next_line-stdout_str->data) < stdout_str->len) {
+		current_line = next_line;
+		next_line = hyper_next_line (current_line);
+
+		//looking for pid in current line
+		pid = hyper_ps_get_pid(current_line, pid_last_index);
+		if (pid < 0) {
+			break;
+		}
+
+		//check if current pid is part of container
+		/* FIXME:
+		 * 1. get all processes running in container namespace
+		 * 2. compare them with the list of processes of ps
+		 */
+		if (hyper_find_exec_by_pid(&pod->exec_head, pid)) {
+			//add this line to final ps output
+			hyper_string_append (final_ps_output, current_line,
+				next_line-current_line);
+			hyper_string_append (final_ps_output, "\n", 1);
+		}
+		if (! next_line) {
+			break;
+		}
+	}
+
+	fprintf (stderr, "FIXME final ps output:\n%s\n", final_ps_output->data);
+
+	ret = 0;
+out:
+	json_value_free (value);
+	hyper_string_free (stdout_str);
+	hyper_string_free (stderr_str);
+	hyper_string_free (final_ps_output);
+	strvfree(args);
+	return ret;
+}
+
 struct hyper_file_arg {
 	int 		rw;
 	int 		mntns;
@@ -1080,6 +1291,9 @@ static int hyper_channel_handle(struct hyper_event *de, uint32_t len)
 		break;
 	case SETUPROUTE:
 		ret = hyper_cmd_setup_route((char *)buf->data + 8, len - 8);
+		break;
+	case PSCONTAINER:
+		ret = hyper_ps_container((char *)buf->data + 8, len - 8);
 		break;
 	default:
 		ret = -1;

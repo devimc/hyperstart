@@ -61,6 +61,12 @@ struct hyper_ctl {
 	struct hyper_event	chan;
 };
 
+struct hyper_string {
+	size_t cap;
+	int    len;
+	char  *data;
+};
+
 static inline int hyper_symlink(char *oldpath, char *newpath)
 {
 	return symlink(oldpath, newpath);

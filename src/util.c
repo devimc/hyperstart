@@ -718,3 +718,40 @@ ssize_t nonblock_read(int fd, void *buf, size_t count)
 
 	return len > 0 ? len : ret;
 }
+
+int hyper_string_append (struct hyper_string *str, const char *src, size_t n)
+{
+	char* tmp;
+	if (str->cap <= str->len+n) {
+		str->cap += BUFSIZ;
+		tmp = realloc(str->data, str->cap*sizeof(*str->data));
+		if (! tmp) {
+			fprintf (stderr, "failed to realloc str data\n");
+			return 1;
+		}
+		str->data = tmp;
+	}
+	str->len += snprintf(str->data+str->len, n+1, "%s", src);
+	return 0;
+}
+
+struct hyper_string *hyper_string_new()
+{
+	struct hyper_string* string = malloc(sizeof(*string));
+	string->cap = BUFSIZ;
+	string->data = malloc (string->cap * sizeof(*string->data));
+	string->len = 0;
+	return string;
+}
+
+char *hyper_next_line(char* data)
+{
+	char *next_line = strchr(data, '\n');
+	if (! next_line) {
+		return NULL;
+	}
+	*next_line = '\0';
+	next_line+=1;
+
+	return next_line;
+}

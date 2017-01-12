@@ -24,7 +24,7 @@ else
 fi
 
 # create symlinks to busybox and iptables
-BUSYBOX_BINARIES=(/bin/sh /bin/tar /bin/hwclock /sbin/modprobe /sbin/depmod)
+BUSYBOX_BINARIES=(/bin/sh /bin/tar /bin/hwclock /sbin/modprobe /sbin/depmod /bin/ps)
 for bin in ${BUSYBOX_BINARIES[@]}
 do
 	mkdir -p /tmp/hyperstart-rootfs/`dirname ${bin}`

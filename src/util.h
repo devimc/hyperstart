@@ -8,6 +8,7 @@
 
 struct hyper_pod;
 struct env;
+struct hyper_string;
 
 #ifdef WITH_DEBUG
 #define dprintf(fmt, ...) \
@@ -15,6 +16,11 @@ struct env;
 #else
 #define dprintf(fmr, ...)
 #endif
+
+#define hyper_string_free(str) if (str) { \
+	if (str->data) { free (str->data); str->data = NULL; } \
+	str->len = 0; free(str); str=NULL; \
+}
 
 char *read_cmdline(void);
 int hyper_setup_env(struct env *envs, int num);
@@ -40,4 +46,7 @@ struct passwd *hyper_getpwnam(const char *name);
 struct group *hyper_getgrnam(const char *name);
 int hyper_getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups);
 ssize_t nonblock_read(int fd, void *buf, size_t count);
+int hyper_string_append (struct hyper_string *str, const char *src, size_t n);
+struct hyper_string *hyper_string_new();
+char *hyper_next_line(char* data);
 #endif
