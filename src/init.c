@@ -21,6 +21,8 @@
 #include <ctype.h>
 #include <sys/prctl.h>
 
+#include <criu/criu.h>
+
 #include "../config.h"
 #include "hyper.h"
 #include "net.h"
@@ -720,6 +722,69 @@ out:
 	return ret;
 }
 
+static int hyper_checkpoint_container(char *json, int length)
+{
+	struct hyper_container *c = NULL;
+	struct hyper_pod *pod = &global_pod;
+	int ret = -1;
+
+	JSON_Value *value = hyper_json_parse(json, length);
+	if (value == NULL) {
+		goto out;
+	}
+
+	const char *id = json_object_get_string(json_object(value), "container");
+	c = hyper_find_container(pod, id);
+	if (c == NULL) {
+		fprintf(stderr, "can not find container whose id is %s\n", id);
+		goto out;
+	}
+
+	if (! c->exec.pid) {
+		fprintf(stderr, "there is not a process running in container %s\n", id);
+		goto out;
+	}
+
+	char path[512];
+	int fd;
+	fprintf(stderr, "#### SHARED_DIR: %s\n", SHARED_DIR);
+	snprintf(path, sizeof(path), "%s/checkpoint", SHARED_DIR);
+	fd = open(path, O_DIRECTORY);
+	ret = hyper_mkdir(path, 0755);
+	if (ret) {
+		fprintf(stderr, "failed to create checkpoint directory: %s\n", path);
+		goto out;
+	}
+	fprintf(stderr, "#### criu_init_opts\n");
+	sprintf(path, "/tmp/hyper/%s/root/%s/", c->id, c->rootfs);
+	
+	criu_init_opts();
+	//criu_set_shell_job(1);
+	fprintf(stderr, "#### criu_set_pid: %d\n", c->exec.pid);
+	criu_set_pid(c->exec.pid);
+	criu_set_log_file("dump.log");
+	criu_set_log_level(4);
+	criu_set_images_dir_fd(fd);
+	fd = open(path, O_DIRECTORY);
+	criu_set_work_dir_fd (fd);
+	//criu_set_evasive_devices(true);
+	//criu_set_manage_cgroups(true);
+	//criu_set_manage_cgroups_mode(CRIU_CG_MODE_IGNORE);
+
+	ret = criu_dump();
+	if (ret < 0) {
+		fprintf(stderr, "failed to dump process: %d\n", c->exec.pid);
+		goto out;
+	}
+
+	fprintf(stderr, "#### killing: %d\n", c->exec.pid);
+	kill(c->exec.pid, SIGKILL);
+
+	ret = 0;
+out:
+	json_value_free(value);
+	return ret;
+}
 struct hyper_file_arg {
 	int 		rw;
 	int 		mntns;
@@ -1145,6 +1210,10 @@ static int hyper_channel_handle(struct hyper_event *de, uint32_t len)
 		break;
 	case SETUPROUTE:
 		ret = hyper_cmd_setup_route((char *)buf->data + 8, len - 8);
+		break;
+	case CHECKPOINTCONTAINER:
+		fprintf(stderr, "### Checkpoint Container");
+		ret = hyper_checkpoint_container((char *)buf->data + 8, len - 8);
 		break;
 	default:
 		ret = -1;
