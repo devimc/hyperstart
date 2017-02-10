@@ -14,9 +14,10 @@ AM_PROG_CC_C_O
 AC_CHECK_PROG(PKG_CONFIG, [pkg-config], [pkg-config], [:])
 
 # Checks for libraries.
+PKG_CHECK_MODULES([CRIU], [criu])
 
 # Checks for header files.
-AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h stddef.h stdint.h stdlib.h string.h sys/mount.h sys/socket.h unistd.h stdbool.h],
+AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h stddef.h stdint.h stdlib.h string.h sys/mount.h sys/socket.h unistd.h stdbool.h criu/criu.h],
 [headers_found=yes],
 [headers_found=no])
 
