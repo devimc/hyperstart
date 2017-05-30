@@ -89,7 +89,7 @@ int hyper_copy_dir(char *src, char *dest)
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "tar cf - -C %s . | tar fx - -C %s", src, dest);
 
-	return hyper_cmd(cmd);
+	return hyper_cmd(cmd, NULL, NULL);
 }
 
 void hyper_sync_time_hctosys() {
@@ -775,15 +775,113 @@ void hyper_shutdown()
 	reboot(LINUX_REBOOT_CMD_POWER_OFF);
 }
 
-int hyper_cmd(char *cmd)
+/**
+ * Reads command stdout
+ *
+ * \param stdout_pipe command stdout fd
+ * \param[out] output command stdout
+ * \param[out] size command stdout size, if is NULL then it is not used
+ *
+ * \return 0 on success, else -1
+ */
+static int hyper_read_cmd_stdout(int stdout_pipe, uint8_t **output, size_t *size)
+{
+	size_t total_bytes_read = 0;
+	int bytes_read = 0;
+	size_t bufsize = 512;
+	uint8_t *buffer = NULL;
+
+	if (stdout_pipe < 0 || output == NULL) {
+		return -1;
+	}
+
+	buffer = calloc(bufsize, sizeof(*buffer));
+
+	if (buffer == NULL) {
+		/* try once again */
+		buffer = calloc(bufsize, sizeof(*buffer));
+	}
+
+	if (buffer == NULL) {
+		return -1;
+	}
+
+	do {
+		bytes_read = read(stdout_pipe,
+			buffer+total_bytes_read, bufsize-total_bytes_read);
+
+		if (bytes_read < 0) {
+			/* there is no more data */
+			break;
+		}
+
+		if (bytes_read > 0) {
+			total_bytes_read += bytes_read;
+		}
+
+		if (total_bytes_read > bufsize-1) {
+			uint8_t *tmp = NULL;
+			bufsize+=bufsize;
+			tmp = realloc(buffer, bufsize * sizeof(*buffer));
+			if (tmp == NULL) {
+				/* try to reallocate once again */
+				tmp = realloc(buffer, bufsize * sizeof(*buffer));
+			}
+			if (tmp == NULL) {
+				/* still NULL, free and return -1 */
+				free(buffer);
+				return -1;
+			}
+			buffer = tmp;
+		}
+	} while (bytes_read > 0);
+
+	/* end of string */
+	buffer[total_bytes_read] = '\0';
+
+	*output = buffer;
+
+	if (size) {
+		*size = total_bytes_read;
+	}
+
+	return 0;
+}
+
+/**
+ * runs a command
+ *
+ * \param cmd command to run
+ * \param[out] output command stdout, if is NULL then it is not used
+ * \param[out] size command stdout size, if is NULL then it is not used
+ *
+ * \return 0 if command exited normally, else -1
+ */
+int hyper_cmd(char *cmd, uint8_t **output, size_t *size)
 {
 	int pid, status;
+	int stdout_pipe[2] = { -1, -1 };
+
+	if (output != NULL) {
+		if (pipe(stdout_pipe) == -1) {
+			perror("failed to open stdout pipe");
+			return -1;
+		}
+	}
 
 	pid = fork();
 	if (pid < 0) {
 		perror("fail to fork");
 		return -1;
 	} else if (pid > 0) {
+		if (output != NULL) {
+			close(stdout_pipe[1]);
+			if (hyper_read_cmd_stdout(stdout_pipe[0], output, size) != 0) {
+				return -1;
+			}
+			close(stdout_pipe[0]);
+		}
+
 		if (waitpid(pid, &status, 0) <= 0) {
 			perror("waiting fork cmd failed");
 			return -1;
@@ -799,6 +897,12 @@ int hyper_cmd(char *cmd)
 		return -1;
 	} else {
 		fprintf(stdout, "executing cmd %s\n", cmd);
+
+		if (output != NULL) {
+			close(stdout_pipe[0]);
+			dup2(stdout_pipe[1], STDOUT_FILENO);
+		}
+
 		execlp("sh", "sh", "-c", cmd, NULL);
 	}
 

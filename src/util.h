@@ -5,6 +5,7 @@
 #include <grp.h>
 #include <pwd.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include "../config.h"
 
 struct hyper_pod;
@@ -30,7 +31,7 @@ int hyper_copy_dir(char *src, char *dst);
 void hyper_sync_time_hctosys();
 void online_cpu(void);
 void online_memory(void);
-int hyper_cmd(char *cmd);
+int hyper_cmd(char *cmd, uint8_t **output, size_t *size);
 int hyper_create_file(const char *hyper_path);
 void hyper_filize(char *hyper_path);
 int hyper_mkdir(char *path, mode_t mode);
