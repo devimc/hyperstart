@@ -36,6 +36,56 @@ struct hyper_pod global_pod = {
 	.exec_head	=	LIST_HEAD_INIT(global_pod.exec_head),
 };
 
+struct hyper_ps_data {
+	/**
+	 * line to process, it contains information about a process.
+	 * The format will vary depending on the arguments provided to
+	 * the ps command.
+	 * for example if the argument is '-ef':
+	 *   root 5123 2 0 09:51 ? 00:00:00 [kworker/2:0]
+	 */
+	const char *line;
+
+	/**
+	 * line length
+	 */
+	size_t line_len;
+
+	/**
+	 * pid index, it depends of ps output
+	 * in next example pid_index is 1:
+	 *   UID PID PPID C STIME TTY TIME CMD
+	 */
+	size_t pid_index;
+
+	/**
+	 * container process id
+	 */
+	pid_t container_pid;
+
+	/**
+	 * mnt ns file serial number
+	 * useful to check if a process is running inside a container
+	 */
+	ino_t container_st_ino;
+
+	/**
+	 * if current line has a pid that is running in the same namespace
+	 * of container_pid then append it to output
+	 */
+	uint8_t **output;
+
+	/**
+	 * output length
+	 */
+	uint32_t *output_len;
+
+	/**
+	 * output capacity
+	 */
+	uint32_t output_cap;
+};
+
 #define MAXEVENTS	10
 
 #define PROC_UPTIME_PATH "/proc/uptime"
@@ -720,6 +770,389 @@ out:
 	return ret;
 }
 
+/**
+ * converts a line to an array, splits the line in tokens with strtok using
+ * horizontal spaces (\n\t ) as delimiter 
+ *
+ * \param line to process
+ * \param[out] array_size array size
+ * \param max_num_tokens max number of tokens that array should contain, if -1
+ * then there is no limit
+ *
+ * \return an array on success, else NULL
+ */
+static char **hyper_line_to_array(char *line, size_t *array_size, int max_num_tokens)
+{
+	char **array = NULL;
+	size_t size = 12;
+
+	if (max_num_tokens == 0) {
+		return NULL;
+	}
+
+	array = (char **)calloc(size, sizeof(*array));
+	if (array == NULL) {
+		return NULL;
+	}
+
+	size_t i = 0;
+	char *delim = " \n\t";
+	char *tok = strtok(line, delim);
+	while (tok != NULL) {
+		array[i++] = tok;
+
+		if (i >= size-1) {
+			char **tmp = NULL;
+			size += size;
+			tmp = (char **)realloc(array, size * sizeof(*array));
+			if (tmp == NULL) {
+				/* try to reallocate once again */
+				tmp = (char **)realloc(array, size * sizeof(*array));
+			}
+			if (tmp == NULL) {
+				/* realloc failed, free memory and return NULL */
+				free(array);
+				return NULL;
+			}
+			array = tmp;
+		}
+
+		if (max_num_tokens > 0 && (--max_num_tokens) == 0) {
+			break;
+		}
+
+		tok = strtok(NULL, delim);
+	}
+
+	if (array_size != NULL) {
+		*array_size = i;
+	}
+
+	/* Add NULL terminator */
+	array[i] = NULL;
+
+	return array;
+}
+
+/**
+ * gets the index of PID, for example in the next line pid index is 1
+ *    UID PID PPID C STIME TTY TIME CMD
+ *
+ * \param line to process
+ *
+ * \return pid index on success, else -1
+ */
+static int hyper_get_pid_index(const char *line)
+{
+	char **array = NULL;
+	char *new_line = NULL;
+	int ret = -1;
+	const char* pid_str = "PID";
+	const size_t pid_str_size = 3;
+
+	if (line == NULL) {
+		return -1;
+	}
+
+	new_line = strdup(line);
+	if (new_line == NULL) {
+		fprintf(stderr, "can not duplicate string: %s\n", line);
+		return -1;
+	}
+
+	array = hyper_line_to_array(new_line, NULL, -1);
+	if (array == NULL) {
+		fprintf(stderr, "can not convert line to array: %s\n", new_line);
+		goto out;
+	}
+
+	for (size_t i=0; array[i] != NULL; i++) {
+		if (strncmp(array[i], pid_str, pid_str_size) == 0) {
+			ret = i;
+			break;
+		}
+	}
+
+out:
+	free_if_set(new_line);
+	free_if_set(array);
+	return ret;
+}
+
+/**
+ * appends current ps line to final ps output
+ *
+ * \param[in,out] ps_data \ref hyper_ps_data
+ *
+ * \return true on success, else false
+ */
+static bool hyper_append_ps_line(struct hyper_ps_data *ps_data)
+{
+	/* +1 for \n */
+	size_t line_len = ps_data->line_len + 1;
+	size_t output_len = *ps_data->output_len;
+	const size_t buf_size_increment = 1024;
+	int ret = -1;
+
+	if (ps_data == NULL) {
+		return false;
+	}
+
+	if (ps_data->output_cap < line_len) {
+		uint8_t *tmp = NULL;
+
+		tmp = (uint8_t *)realloc(*ps_data->output,
+			(ps_data->output_cap + output_len + buf_size_increment) * sizeof(**ps_data->output));
+
+		if (tmp == NULL) {
+			/* try to reallocate once again */
+			tmp = (uint8_t *)realloc(*ps_data->output,
+				(ps_data->output_cap + output_len + buf_size_increment) * sizeof(**ps_data->output));
+		}
+
+		if (tmp == NULL) {
+			return false;
+		}
+
+		*ps_data->output = tmp;
+		ps_data->output_cap += buf_size_increment;
+	}
+
+	ret = snprintf((char*)(*ps_data->output + output_len),
+		line_len + 1, "%s\n", ps_data->line);
+	if (ret < 0) {
+		return false;
+	}
+
+	ps_data->output_cap -= ret;
+	*ps_data->output_len += ret;
+
+	return true;
+}
+
+/**
+ * process each ps line:
+ * - if pid is equal to container pid then add current line to the
+ *   final ps output (ps_data->output)
+ * - check if pid is running in the same container mount namespace,
+ *   if it is then add current line to the final ps output (ps_data->output)
+ *
+ * \param[in,out] ps_data \ref hyper_ps_data
+ *
+ * \return true on success, else false
+ */
+static bool hyper_process_ps_line(struct hyper_ps_data *ps_data)
+{
+	char *new_process_line = NULL;
+	char **array = NULL;
+	size_t array_size = 0;
+	pid_t pid;
+	char mnt_ns_path[PATH_MAX];
+	struct stat st;
+
+	if (ps_data == NULL) {
+		return false;
+	}
+
+	new_process_line = strdup(ps_data->line);
+	if (new_process_line == NULL) {
+		fprintf(stderr, "can not dup string '%s': %s\n",
+			ps_data->line, strerror(errno));
+		return false;
+	}
+
+	array = hyper_line_to_array(new_process_line, &array_size, ps_data->pid_index+1);
+	if (array == NULL) {
+		fprintf(stderr, "can not convert line to array: %s\n", new_process_line);
+		free_if_set(new_process_line);
+		return false;
+	}
+
+	if (ps_data->pid_index >= array_size) {
+		/* current line has not a pid */
+		goto out;
+	}
+
+	/* get pid from line */
+	pid = strtol(array[ps_data->pid_index], NULL, 10);
+	if (pid == 0) {
+		fprintf(stderr, "can not convert string '%s' to int: %s\n",
+			array[ps_data->pid_index], strerror(errno));
+		goto out;
+	}
+
+	/* if pid is equal to container pid */
+	if (pid == ps_data->container_pid) {
+		hyper_append_ps_line(ps_data);
+		goto out;
+	}
+
+	snprintf(mnt_ns_path, PATH_MAX, "/proc/%d/ns/mnt", pid);
+	if (stat(mnt_ns_path, &st) < 0) {
+		goto out;
+	}
+
+	/* check if pid is running in the container's namespace */
+	if (ps_data->container_st_ino == st.st_ino) {
+		hyper_append_ps_line(ps_data);
+		goto out;
+	}
+
+out:
+	free_if_set(new_process_line);
+	free_if_set(array);
+
+	return true;
+}
+
+/**
+ * runs ps command to see what command are running inside the container
+ *
+ * \param json contains ps command arguments and container id
+ * \param length json length
+ * \param[out] datalen ps command output length
+ * \param[out] data ps command output, this output only have the processes that
+ * are running inside the container
+ *
+ * \return 0 on success, else -1
+ */
+static int hyper_ps_container(char *json, int length, uint32_t *datalen, uint8_t **data)
+{
+	struct hyper_container *c;
+	struct hyper_pod *pod = &global_pod;
+	int ret = -1;
+	char command[1024] = { 0 };
+	uint8_t *output = NULL;
+	size_t output_size = 0;
+
+	if (json == NULL || datalen == NULL || data == NULL) {
+		return -1;
+	}
+
+	JSON_Value *value = hyper_json_parse(json, length);
+	if (value == NULL) {
+		goto out;
+	}
+
+	/* get container id */
+	const char *id = json_object_get_string(json_object(value), "container");
+	c = hyper_find_container(pod, id);
+	if (c == NULL) {
+		fprintf(stderr, "can not find container whose id is %s\n", id);
+		goto out;
+	}
+
+	/* get ps args */
+	int bytes_copied = snprintf(command, sizeof(command), "ps");
+
+	if (bytes_copied < 0) {
+		fprintf(stderr, "can not copy 'ps' to command\n");
+		goto out;
+	}
+	
+	JSON_Array *ps_args = json_object_get_array(json_object(value), "psargs");
+	size_t ps_args_size = json_array_get_count(ps_args);
+
+	/*copy ps args to command */
+	for (size_t i=0; i<ps_args_size; i++) {
+		const char *arg = json_array_get_string(ps_args, i);
+		fprintf(stdout, "ps_args[%ld]=%s\n", i, arg);
+
+		/* $ and ` are not valid characters in the ps command
+		 * this validation is to avoid command injections
+		 */
+		if (!strstr(arg, "$") && !strstr(arg, "`")) {
+			ret = snprintf(command+bytes_copied,
+				sizeof(command)-bytes_copied, " '%s'", arg);
+
+			if (ret < 0) {
+				fprintf(stderr, "can not copy arg '%s' to command\n", arg);
+				goto out;
+			}
+
+			bytes_copied += ret;
+		}
+	}
+
+	/* run ps command */
+	if (hyper_cmd(command, &output, &output_size) != 0) {
+		goto out;
+	}
+
+	/* get pid index form ps output */
+	char *header_end = NULL;
+	char *header_line = NULL;
+	int pid_index = -1;
+
+	header_end = strstr((char*)output, "\n");
+	*header_end = '\0';
+	header_line = strdup((char*)output);
+	if (header_line == NULL) {
+		fprintf(stderr, "can not dup string: %s\n", (char*)output);
+		goto out;
+	}
+
+	pid_index = hyper_get_pid_index(header_line);
+	free(header_line);
+	if (pid_index == -1) {
+		fprintf(stderr, "can not find PID index: %s\n", (char*)output);
+		goto out;
+	}
+
+	/* get mnt ns file serial number */
+	struct stat st;
+	if (fstat(c->ns, &st) < 0) {
+		perror("fail to stat mnt ns");
+		goto out;
+	}
+
+	/* allocate at least 1 byte for \0 */
+	*data = calloc(1, sizeof(**data));
+
+	struct hyper_ps_data ps_data = {
+		.pid_index        = (size_t)pid_index,
+		.container_pid    = c->exec.pid,
+		.container_st_ino = st.st_ino,
+		.output           = data,
+		.output_len       = datalen,
+		.output_cap       = 0,
+	};
+
+	char *process_line = NULL;
+
+	/* header_end+1 next line, skip header line */
+	char *line_end = header_end+1;
+
+	/* processing each line of ps output */
+	while ((line_end-(char*)output) < output_size) {
+		process_line = line_end;
+		line_end = strstr(process_line, "\n");
+		if (line_end == NULL) {
+			/* no more lines */
+			break;
+		}
+
+		*line_end = '\0';
+
+		/* copy current process line */
+		ps_data.line = process_line;
+		ps_data.line_len = line_end - process_line;
+
+		if (! hyper_process_ps_line(&ps_data)) {
+			break;
+		}
+
+		line_end++;
+	}
+
+	ret = 0;
+
+out:
+	free_if_set(output);
+	json_value_free(value);
+	return ret;
+}
+
 struct hyper_file_arg {
 	int 		rw;
 	int 		mntns;
@@ -1145,6 +1578,9 @@ static int hyper_channel_handle(struct hyper_event *de, uint32_t len)
 		break;
 	case SETUPROUTE:
 		ret = hyper_cmd_setup_route((char *)buf->data + 8, len - 8);
+		break;
+	case PSCONTAINER:
+		ret = hyper_ps_container((char *)buf->data + 8, len - 8, &datalen, &data);
 		break;
 	default:
 		ret = -1;
