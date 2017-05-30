@@ -16,7 +16,7 @@
 
 int hyper_init_modules() 
 {
-	int status = hyper_cmd("depmod");
+	int status = hyper_cmd("depmod", NULL, NULL);
 	if (status != 0) {
 		fprintf(stderr, "depmod failed, status: %d\n", status);
 		return -1;
@@ -39,7 +39,7 @@ int hyper_setup_iptables_rule(struct ipt_rule rule)
 	}
 
 	if (strlen(check_cmd) > 0) {
-		check = hyper_cmd(check_cmd);
+		check = hyper_cmd(check_cmd, NULL, NULL);
 		fprintf(stdout, "check iptables '%s', ret: %d\n", check_cmd, check);
 	}
 
@@ -53,7 +53,7 @@ int hyper_setup_iptables_rule(struct ipt_rule rule)
 		}
 	}
 
-	int status = hyper_cmd(cmd);
+	int status = hyper_cmd(cmd, NULL, NULL);
 	fprintf(stdout, "insert iptables '%s', ret: %d\n", cmd, status);
 	if (status != 0) {
 		fprintf(stderr, "insert iptables rule failed, ret: %d\n", status);
